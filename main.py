@@ -20,13 +20,14 @@ whatever the grader ships):
     Yotei, Resident Evil Requiem: hour-21 ratio 3.6-11.5). The slope is
     about -0.35 and is stable across leave-one-out folds. Per hour, the
     intercept mu_h and spread sd_h come from the slope-adjusted residuals.
-  - q_tau(h) = p1 * exp(mu_h + b * (log(p1) - mean_log_p1) + z_tau * sd_h),
-    z_tau the standard normal quantiles (-1.645, -0.674, 0, 0.674, 1.645),
-    rounded to 2 decimals half up. Quantiles are non-decreasing by
-    construction, positive, and capped at 1e9.
+  - q_tau(h) = p1 * exp(mu_h + b * (log(p1) - mean_log_p1) + r_tau(h)),
+    r_tau(h) the tau-quantile of hour h's slope-adjusted residuals
+    (empirical, not a normal fit: with ~11 launches per hour the residual
+    shape is what it is), rounded to 2 decimals half up. Quantiles are
+    non-decreasing by construction, positive, and capped at 1e9.
 
 Leave-one-out pinball loss (2x convention, mean over 23h x 5 quantiles) on
-the 12 rolling-midnight comparables: 0.266, vs 0.357 for the house baseline
+the 12 rolling-midnight comparables: 0.2615, vs 0.357 for the house baseline
 persistence starter. Deterministic: no clock, no randomness, fixed
 iteration order; two runs write identical bytes.
 
@@ -58,8 +59,6 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 # The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
-Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
 
 
 def round2(x: float) -> float | int:
@@ -102,11 +101,15 @@ def is_rolling(comp: dict) -> bool:
 
 
 def fit(train: list) -> tuple:
-    """Pooled slope b, mean log p1, and per-hour (mu, sd) of log-ratios.
+    """Pooled slope b, mean log p1, and per-hour (mu, residuals) of log-ratios.
 
     train is a list of day series (dict hour -> viewers). The slope is fit
-    on every (game, hour) pair pooled; mu_h / sd_h come from the residuals
-    after removing the slope, so a big launch gets a flatter curve.
+    on every (game, hour) pair pooled; mu_h is the slope-adjusted mean
+    log-ratio for hour h, and the residuals around it carry the hour's
+    spread, used as empirical quantiles instead of a normal assumption:
+    with ~11 launches per hour the residual shape is what it is, and the
+    empirical quantiles scored better than normal tails in leave-one-out
+    (0.2615 vs 0.2656 mean pinball loss).
     """
     xs, ys = [], []
     for s in train:
@@ -118,14 +121,24 @@ def fit(train: list) -> tuple:
     my = sum(ys) / len(ys)
     var = sum((x - mx) ** 2 for x in xs)
     b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var if var else 0.0
-    mu, sd = {}, {}
+    mu, res = {}, {}
     for h in range(2, 25):
-        res = [math.log(s[h] / s[1]) - b * (math.log(s[1]) - mx) for s in train]
-        m = sum(res) / len(res)
-        var2 = sum((x - m) ** 2 for x in res) / max(1, len(res) - 1)
-        mu[h] = m
-        sd[h] = math.sqrt(var2)
-    return b, mx, mu, sd
+        r = [math.log(s[h] / s[1]) - b * (math.log(s[1]) - mx) for s in train]
+        mu[h] = sum(r) / len(r)
+        res[h] = sorted(x - mu[h] for x in r)
+    return b, mx, mu, res
+
+
+def quantile(vals: list, tau: float) -> float:
+    """Linear-interpolation quantile of a sorted list (numpy's default)."""
+    n = len(vals)
+    if n == 1:
+        return vals[0]
+    pos = tau * (n - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    f = pos - lo
+    return vals[lo] * (1 - f) + vals[hi] * f
 
 
 def forecast_case(case: dict, name: str) -> dict:
@@ -154,16 +167,17 @@ def forecast_case(case: dict, name: str) -> dict:
     train = rolling if len(rolling) >= 5 else [s for _, s in series]
     if not train:
         # No usable comparables at all: fall back to the house baseline.
-        return {"hours": [{"hour": h, "q": [round2(p1 * math.exp(z * 0.15 * math.sqrt(h - 1))) for z in Z]} for h in range(2, 25)]}
+        zs = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
+        return {"hours": [{"hour": h, "q": [round2(p1 * math.exp(z * 0.15 * math.sqrt(h - 1))) for z in zs]} for h in range(2, 25)]}
 
-    b, mx, mu, sd = fit(train)
+    b, mx, mu, res = fit(train)
     hours = []
     for row in case["forecast"]:
         h = row["hour"]
-        adj = mu[h] + b * (math.log(p1) - mx)
+        center = mu[h] + b * (math.log(p1) - mx)
         qs = []
-        for z in Z:
-            q = p1 * math.exp(adj + z * sd[h])
+        for tau in LEVELS:
+            q = p1 * math.exp(center + quantile(res[h], tau))
             q = min(q, 1e9)
             qs.append(round2(max(q, 0.01)))
         # Keep the row non-decreasing after rounding (rounding can tie, never invert).
